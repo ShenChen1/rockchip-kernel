@@ -122,7 +122,7 @@ int fts_wait_tp_to_valid(void)
     for (i = 0; i < FTS_MAX_RETRIES_READID; i++) {
         ret = fts_read_reg(FTS_REG_CHIP_ID, &idh);
         if ((idh == chip_idh) || (fts_check_cid(ts_data, idh) == 0)) {
-            FTS_INFO("TP Ready,Device ID:0x%02x", idh);
+            FTS_DEBUG("TP Ready,Device ID:0x%02x", idh);
             return 0;
         }
         if ((i + 1) < FTS_MAX_RETRIES_READID) fts_msleep((i + 1) * 20);
@@ -1171,7 +1171,7 @@ static int fts_read_parse_touchdata(struct fts_ts_data *ts_data, u8 *touch_buf)
 
     if ((touch_buf[1] == 0xFF) && (touch_buf[2] == 0xFF)
         && (touch_buf[3] == 0xFF) && (touch_buf[4] == 0xFF)) {
-        FTS_INFO("touch buff is 0xff, FW initialized");
+        FTS_DEBUG("touch buff is 0xff, FW initialized");
         return TOUCH_FW_INIT;
     }
 

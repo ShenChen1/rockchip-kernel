@@ -202,7 +202,7 @@ static int fts_ts_probe(struct i2c_client *client, const struct i2c_device_id *i
 
     ts_data->client = client;
     ts_data->dev = &client->dev;
-    ts_data->log_level = 1;
+    ts_data->log_level = 0;
     ts_data->fw_is_running = 0;
     ts_data->bus_type = BUS_TYPE_I2C;
     ts_data->bus_ver = BUS_VER_DEFAULT;
