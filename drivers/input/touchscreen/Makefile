@@ -6,7 +6,7 @@
 # Each configuration option enables a list of files.
 
 # wm97xx-ts-y := wm97xx-core.o
-# goodix_ts-y := goodix.o goodix_fwupload.o
+goodix_ts-y := goodix.o goodix_fwupload.o
 
 obj-$(CONFIG_TOUCHSCREEN_88PM860X)	+= 88pm860x-ts.o
 obj-$(CONFIG_TOUCHSCREEN_AD7877)	+= ad7877.o
@@ -49,6 +49,7 @@ obj-$(CONFIG_TOUCHSCREEN_EGALAX_SERIAL)	+= egalax_ts_serial.o
 obj-$(CONFIG_TOUCHSCREEN_EXC3000)	+= exc3000.o
 obj-$(CONFIG_TOUCHSCREEN_FTS)		+= focaltech_touch/
 obj-$(CONFIG_TOUCHSCREEN_FT5726)	+= focaltech_touch_ft5726/
+obj-$(CONFIG_TOUCHSCREEN_FT8756)	+= focaltech_touch_ft8756/
 obj-$(CONFIG_TOUCHSCREEN_FUJITSU)	+= fujitsu_ts.o
 obj-$(CONFIG_TOUCHSCREEN_GOODIX)	+= goodix_ts.o
 obj-$(CONFIG_TOUCHSCREEN_GSL3673)	+= gsl3673-ts.o

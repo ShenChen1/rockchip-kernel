@@ -392,6 +392,14 @@ config TOUCHSCREEN_FT5726
 	  Say Y here if you have Focaltech touch panel.
 	  If unsure, say N.
 
+config TOUCHSCREEN_FT8756
+	tristate "Focaltech Touchscreen FT8756"
+	depends on I2C
+	default n
+	help
+	  Say Y here if you have Focaltech touch panel FT8756.
+	  If unsure, say N.
+
 config TOUCHSCREEN_FUJITSU
 	tristate "Fujitsu serial touchscreen"
 	select SERIO
