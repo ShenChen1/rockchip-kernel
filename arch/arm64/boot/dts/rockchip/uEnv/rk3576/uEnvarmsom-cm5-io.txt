@@ -30,7 +30,6 @@ enable_uboot_overlays=1
 #dtoverlay=/dtb/overlay/rk3576-armsom-hdmi-disabled-overlay.dtbo
 #vp1
 #dtoverlay=/dtb/overlay/rk3576-armsom-cm5-io-display-1200x1900-10.1hd-overlay.dtbo
-dtoverlay=/dtb/overlay/rk3576-armsom-cm5-io-display-f050008m01-overlay.dtbo
 #vp2
 #dtoverlay=/dtb/overlay/rk3576-armsom-dp-disabled-overlay.dtbo
 
