@@ -371,7 +371,7 @@
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PC5 IRQ_TYPE_LEVEL_LOW>;
 		focaltech,reset-gpio = <&gpio0 RK_PD0 GPIO_ACTIVE_HIGH>;
-		focaltech,irq-gpio = <&gpio0 RK_PC5 IRQ_TYPE_LEVEL_LOW>;
+		focaltech,irq-gpio = <&gpio0 RK_PC5 GPIO_ACTIVE_LOW>;
 		focaltech,display-coords = <0 0 720 1280>;
 		focaltech,max-touch-number = <10>;
 		status = "okay";
