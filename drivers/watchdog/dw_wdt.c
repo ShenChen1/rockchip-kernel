@@ -712,8 +712,25 @@ static const struct of_device_id dw_wdt_of_match[] = {
 MODULE_DEVICE_TABLE(of, dw_wdt_of_match);
 #endif
 
+static void dw_wdt_shutdown(struct platform_device *pdev)
+{
+	struct dw_wdt *dw_wdt = platform_get_drvdata(pdev);
+	int ret;
+
+	if (system_state != SYSTEM_HALT || nowayout || !dw_wdt->rst)
+		return;
+
+	/* Hold WDT in reset on halt so powered-up boards do not reboot. */
+	ret = reset_control_assert(dw_wdt->rst);
+	if (ret)
+		dev_err(&pdev->dev, "failed to assert watchdog reset: %d\n", ret);
+	else
+		dev_info(&pdev->dev, "WDT held in reset for halt\n");
+}
+
 static struct platform_driver dw_wdt_driver = {
 	.probe		= dw_wdt_drv_probe,
+	.shutdown	= dw_wdt_shutdown,
 	.remove		= dw_wdt_drv_remove,
 	.driver		= {
 		.name	= "dw_wdt",
