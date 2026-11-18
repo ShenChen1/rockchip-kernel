@@ -250,5 +250,6 @@
 
 /* watchdog */
 &wdt {
+	resets = <&cru SRST_T_WDT0>;
 	status = "okay";
 };
