@@ -93,7 +93,65 @@ extern int disable_proptx;
 #define AP_TXBCNFRM_TIMEOUT	10000
 #ifdef RXF0OVFL_REINIT_WAR
 #define RXF0OVFL_POLLING_TIMEOUT	1000
-#define RXF0OVFL_THRESHOLD	100
+#define RXF0OVFL_THRESHOLD		100
+#define RXF0OVFL_BCN_MIN		5
+#define RXF0OVFL_STALL_MIN		16
+#define RXF0OVFL_RATIO_PCT		50
+#define RXF0OVFL_STALL_SECS		3
+#define RXF0OVFL_RECOVER_BCN_MIN	1
+#define RXF0OVFL_RECOVER_RXFRAME_MIN	32
+#define RXF0OVFL_RECOVER_RATIO_PCT	10
+#define RXF0OVFL_RECOVER_IDLE_SECS	3
+#define RXF0OVFL_RETRY_MIN_SECS		15
+#define RXF0OVFL_RETRY_MAX_SECS		60
+#define RX_BA_ACTIVE_MIN		16
+#define RX_BA_TXACK_MIN			100
+#define RX_BA_TXACK_RATIO		8
+#define RX_BA_RXFRAME_MAX		1500
+#define RX_BA_STALL_SECS		5
+
+#define RXF0_CNT_HAS_WLC		(1U << 0)
+#define RXF0_CNT_HAS_UCODE		(1U << 1)
+#define RXF0_CNT_HAS_ALL		(RXF0_CNT_HAS_WLC | RXF0_CNT_HAS_UCODE)
+#define RXF0_FIELD_IN_BOUNDS(type, field, len) \
+	((len) >= OFFSETOF(type, field) + sizeof(((const type *)0)->field))
+
+enum wl_rxf0ovfl_action {
+	RXF0_ACT_NONE = 0,
+	RXF0_ACT_REINIT_OVFL = 1,
+	RXF0_ACT_LOG_BA_STALL = 2
+};
+
+/* Atomic counter snapshot captured within one counters ioctl. */
+struct wl_rxf0ovfl_sample {
+	uint32 rxbeaconmbss;
+	uint32 rxf0ovfl;
+	uint32 rxframe;
+	uint32 txackfrm;
+	uint32 txback;
+};
+
+/* Recovery-gated state machine for BCM43752 RX FIFO 0 overflow stall WAR. */
+struct wl_rxf0ovfl_state {
+	uint32 ovfl_stall_cnt;
+	uint32 ba_stall_cnt;
+	uint32 recover_ok_cnt;
+	uint32 retry_backoff;
+	uint32 retry_cooldown;
+	bool baseline_valid;
+	bool wait_recovery;
+	bool seen_txback;
+};
+
+/* Drop short-window stall/baseline tracking while keeping long-lived reinit gating. */
+static inline void
+wl_ext_rxf0ovfl_reset_window(struct wl_rxf0ovfl_state *st)
+{
+	st->ovfl_stall_cnt = 0;
+	st->ba_stall_cnt = 0;
+	st->recover_ok_cnt = 0;
+	st->baseline_valid = FALSE;
+}
 #endif /* RXF0OVFL_REINIT_WAR */
 
 #define MAX_DWDS_IF_NUM 4
@@ -318,8 +376,10 @@ typedef struct wl_apsta_params {
 #endif /* STA_MGMT */
 #ifdef RXF0OVFL_REINIT_WAR
 	timer_list_compat_t rxf0ovfl_timer;
-	uint32 rxbeaconmbss;
-	uint32 rxf0ovfl;
+	struct wl_rxf0ovfl_sample rxf0_cnt;
+	struct wl_rxf0ovfl_sample rxf0_tmp;
+	uint32 rxf0_tmp_mask;
+	struct wl_rxf0ovfl_state rxf0_st;
 	int war_reason;
 #endif /* RXF0OVFL_REINIT_WAR */
 } wl_apsta_params_t;
@@ -3877,8 +3937,10 @@ wl_iapsta_suspend_resume(dhd_pub_t *dhd, int suspend)
 		wl_timer_mod(dhd, &apsta_params->monitor_timer, 0);
 #endif /* TPUT_MONITOR */
 #ifdef RXF0OVFL_REINIT_WAR
-	if (suspend)
+	if (suspend) {
 		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, 0);
+		wl_ext_rxf0ovfl_reset_window(&apsta_params->rxf0_st);
+	}
 #endif
 
 	for (i=0; i<MAX_IF_NUM; i++) {
@@ -3901,6 +3963,7 @@ wl_iapsta_suspend_resume(dhd_pub_t *dhd, int suspend)
 #endif /* TPUT_MONITOR */
 #ifdef RXF0OVFL_REINIT_WAR
 	if (!suspend) {
+		wl_ext_rxf0ovfl_reset_window(&apsta_params->rxf0_st);
 		if (dhd->conf->war & FW_REINIT_RXF0OVFL) {
 			wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
 		}
@@ -5161,6 +5224,19 @@ wl_ext_restart_ap_handler(struct wl_if_info *cur_if,
 #endif /* RESTART_AP_WAR */
 
 #if defined(RESET_AP_WAR) || defined(RXF0OVFL_REINIT_WAR)
+#ifdef RXF0OVFL_REINIT_WAR
+static void
+wl_ext_rxf0_store_ucode(struct wl_apsta_params *apsta_params,
+	uint32 rxbeaconmbss, uint32 rxf0ovfl, uint32 txackfrm, uint32 txback)
+{
+	apsta_params->rxf0_tmp.rxbeaconmbss = dtoh32(rxbeaconmbss);
+	apsta_params->rxf0_tmp.rxf0ovfl = dtoh32(rxf0ovfl);
+	apsta_params->rxf0_tmp.txackfrm = dtoh32(txackfrm);
+	apsta_params->rxf0_tmp.txback = dtoh32(txback);
+	apsta_params->rxf0_tmp_mask |= RXF0_CNT_HAS_UCODE;
+}
+#endif /* RXF0OVFL_REINIT_WAR */
+
 static int
 wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 {
@@ -5170,60 +5246,91 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 	int res = BCME_OK;
 
 	switch (type) {
+#ifdef RXF0OVFL_REINIT_WAR
+		case WL_CNT_XTLV_WLC: {
+			const wl_cnt_wlc_t *cnt = (const wl_cnt_wlc_t *)data;
+			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
+				if (!RXF0_FIELD_IN_BOUNDS(wl_cnt_wlc_t, rxframe, len)) {
+					IAPSTA_ERROR(cur_if->ifname,
+						"type 0x%x, wlc cnt truncated (%u)\n", type, len);
+					break;
+				}
+				apsta_params->rxf0_tmp.rxframe = dtoh32(cnt->rxframe);
+				apsta_params->rxf0_tmp_mask |= RXF0_CNT_HAS_WLC;
+			}
+			break;
+		}
+#endif /* RXF0OVFL_REINIT_WAR */
 		case WL_CNT_XTLV_CNTV_LE10_UCODE: {
-			wl_cnt_v_le10_mcst_t *cnt = (wl_cnt_v_le10_mcst_t *)data;
+			const wl_cnt_v_le10_mcst_t *cnt = (const wl_cnt_v_le10_mcst_t *)data;
 			if (len != sizeof(wl_cnt_v_le10_mcst_t)) {
 				printf("type %d: cnt struct length mismatch! %d != %d\n",
 					type, len, (int)sizeof(wl_cnt_v_le10_mcst_t));
 			}
 #ifdef RESET_AP_WAR
-			if (apsta_params->war_reason == ISAM_RC_AP_RESET)
+			if (apsta_params->war_reason == ISAM_RC_AP_RESET &&
+			    len >= OFFSETOF(wl_cnt_v_le10_mcst_t, txbcnfrm) + sizeof(cnt->txbcnfrm))
 				cur_if->txbcnfrm = dtoh32(cnt->txbcnfrm);
 #endif /* RESET_AP_WAR */
 #ifdef RXF0OVFL_REINIT_WAR
-			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
-				apsta_params->rxbeaconmbss = dtoh32(cnt->rxbeaconmbss);
-				apsta_params->rxf0ovfl = dtoh32(cnt->rxf0ovfl);
+			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_v_le10_mcst_t, rxbeaconmbss, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_v_le10_mcst_t, rxf0ovfl, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_v_le10_mcst_t, txackfrm, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_v_le10_mcst_t, txback, len)) {
+				wl_ext_rxf0_store_ucode(apsta_params,
+					cnt->rxbeaconmbss, cnt->rxf0ovfl,
+					cnt->txackfrm, cnt->txback);
 			}
 #endif /* RXF0OVFL_REINIT_WAR */
 			break;
 		}
-		case WL_CNT_XTLV_GE40_UCODE_V1:
-		{
-			wl_cnt_ge40mcst_v1_t *cnt = (wl_cnt_ge40mcst_v1_t *)data;
+		case WL_CNT_XTLV_GE40_UCODE_V1: {
+			const wl_cnt_ge40mcst_v1_t *cnt = (const wl_cnt_ge40mcst_v1_t *)data;
 			if (len != sizeof(wl_cnt_ge40mcst_v1_t)) {
 				IAPSTA_ERROR(cur_if->ifname,
 					"type 0x%x, cnt struct length mismatch! %d != %d\n",
 					type, len, (int)sizeof(wl_cnt_ge40mcst_v1_t));
 			}
 #ifdef RESET_AP_WAR
-			if (apsta_params->war_reason == ISAM_RC_AP_RESET)
+			if (apsta_params->war_reason == ISAM_RC_AP_RESET &&
+			    len >= OFFSETOF(wl_cnt_ge40mcst_v1_t, txbcnfrm) + sizeof(cnt->txbcnfrm))
 				cur_if->txbcnfrm = dtoh32(cnt->txbcnfrm);
 #endif /* RESET_AP_WAR */
 #ifdef RXF0OVFL_REINIT_WAR
-			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
-				apsta_params->rxbeaconmbss = dtoh32(cnt->rxbeaconmbss);
-				apsta_params->rxf0ovfl = dtoh32(cnt->rxf0ovfl);
+			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge40mcst_v1_t, rxbeaconmbss, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge40mcst_v1_t, rxf0ovfl, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge40mcst_v1_t, txackfrm, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge40mcst_v1_t, txback, len)) {
+				wl_ext_rxf0_store_ucode(apsta_params,
+					cnt->rxbeaconmbss, cnt->rxf0ovfl,
+					cnt->txackfrm, cnt->txback);
 			}
 #endif /* RXF0OVFL_REINIT_WAR */
 			break;
 		}
-		case WL_CNT_XTLV_GE80_UCODE_V1:
-		{
-			wl_cnt_ge80mcst_v1_t *cnt = (wl_cnt_ge80mcst_v1_t *)data;
+		case WL_CNT_XTLV_GE80_UCODE_V1: {
+			const wl_cnt_ge80mcst_v1_t *cnt = (const wl_cnt_ge80mcst_v1_t *)data;
 			if (len != sizeof(wl_cnt_ge80mcst_v1_t)) {
 				IAPSTA_ERROR(cur_if->ifname,
 					"type 0x%x, cnt struct length mismatch! %d != %d\n",
 					type, len, (int)sizeof(wl_cnt_ge80mcst_v1_t));
 			}
 #ifdef RESET_AP_WAR
-			if (apsta_params->war_reason == ISAM_RC_AP_RESET)
+			if (apsta_params->war_reason == ISAM_RC_AP_RESET &&
+			    len >= OFFSETOF(wl_cnt_ge80mcst_v1_t, txbcnfrm) + sizeof(cnt->txbcnfrm))
 				cur_if->txbcnfrm = dtoh32(cnt->txbcnfrm);
 #endif /* RESET_AP_WAR */
 #ifdef RXF0OVFL_REINIT_WAR
-			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
-				apsta_params->rxbeaconmbss = dtoh32(cnt->rxbeaconmbss);
-				apsta_params->rxf0ovfl = dtoh32(cnt->rxf0ovfl);
+			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge80mcst_v1_t, rxbeaconmbss, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge80mcst_v1_t, rxf0ovfl, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge80mcst_v1_t, txackfrm, len) &&
+			    RXF0_FIELD_IN_BOUNDS(wl_cnt_ge80mcst_v1_t, txback, len)) {
+				wl_ext_rxf0_store_ucode(apsta_params,
+					cnt->rxbeaconmbss, cnt->rxf0ovfl,
+					cnt->txackfrm, cnt->txback);
 			}
 #endif /* RXF0OVFL_REINIT_WAR */
 			break;
@@ -5257,10 +5364,18 @@ wl_ext_counters_update(struct wl_if_info *cur_if, int war_reason)
 	cntinfo->datalen = dtoh16(cntinfo->datalen);
 	ver = cntinfo->version;
 	CHK_CNTBUF_DATALEN(iovar_buf, WLC_IOCTL_MEDLEN);
+	if (cntinfo->datalen + OFFSETOF(wl_cnt_info_t, data) > WLC_IOCTL_MEDLEN) {
+		IAPSTA_ERROR(cur_if->ifname,
+			"counters datalen %u exceeds buffer %d\n",
+			cntinfo->datalen, WLC_IOCTL_MEDLEN);
+		ret = BCME_BUFTOOLONG;
+		goto exit;
+	}
 	if (ver > WL_CNT_VERSION_XTLV) {
 		IAPSTA_ERROR(cur_if->ifname,
 			"Incorrect version of counters struct: expected %d; got %d\n",
 			WL_CNT_VERSION_XTLV, ver);
+		ret = BCME_VERSION;
 		goto exit;
 	}
 
@@ -5378,6 +5493,170 @@ wl_ext_rxf0ovfl_reinit_timeout(unsigned long data)
 	wl_ext_event_send(dhd->event_params, &msg, NULL);
 }
 
+static bool
+wl_ext_rxf0_read_sample(struct wl_if_info *cur_if, struct wl_rxf0ovfl_sample *out)
+{
+	struct dhd_pub *dhd = dhd_get_pub(cur_if->dev);
+	struct wl_apsta_params *apsta_params = dhd->iapsta_params;
+	int ret;
+
+	memset(&apsta_params->rxf0_tmp, 0, sizeof(apsta_params->rxf0_tmp));
+	apsta_params->rxf0_tmp_mask = 0;
+
+	ret = wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
+	if (ret || apsta_params->rxf0_tmp_mask != RXF0_CNT_HAS_ALL) {
+		IAPSTA_ERROR(cur_if->ifname,
+			"rxf0 counters incomplete: ret=%d mask=0x%x\n",
+			ret, apsta_params->rxf0_tmp_mask);
+		return FALSE;
+	}
+
+	*out = apsta_params->rxf0_tmp;
+	return TRUE;
+}
+
+static void
+wl_ext_rxf0ovfl_on_reinit_result(struct wl_rxf0ovfl_state *st, int ret)
+{
+	wl_ext_rxf0ovfl_reset_window(st);
+
+	if (ret == 0) {
+		st->wait_recovery = TRUE;
+		st->retry_backoff = 0;
+		st->retry_cooldown = 0;
+		return;
+	}
+
+	st->wait_recovery = FALSE;
+	if (st->retry_backoff == 0)
+		st->retry_backoff = RXF0OVFL_RETRY_MIN_SECS;
+	else
+		st->retry_backoff *= 2;
+	if (st->retry_backoff > RXF0OVFL_RETRY_MAX_SECS)
+		st->retry_backoff = RXF0OVFL_RETRY_MAX_SECS;
+	st->retry_cooldown = st->retry_backoff;
+}
+
+static bool
+wl_ext_rxf0ovfl_check_recovered(const struct wl_rxf0ovfl_sample *d,
+	struct wl_rxf0ovfl_state *st)
+{
+	if (d->rxbeaconmbss < RXF0OVFL_RECOVER_BCN_MIN ||
+	    (d->rxbeaconmbss < RXF0OVFL_BCN_MIN && d->rxf0ovfl > RXF0OVFL_THRESHOLD)) {
+		st->recover_ok_cnt = 0;
+		return FALSE;
+	}
+
+	if (d->rxframe >= RXF0OVFL_RECOVER_RXFRAME_MIN &&
+	    (uint64)d->rxf0ovfl * 100 < (uint64)d->rxframe * RXF0OVFL_RECOVER_RATIO_PCT) {
+		st->recover_ok_cnt = 0;
+		return TRUE;
+	}
+
+	if (d->rxf0ovfl == 0) {
+		if (++st->recover_ok_cnt >= RXF0OVFL_RECOVER_IDLE_SECS) {
+			st->recover_ok_cnt = 0;
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	st->recover_ok_cnt = 0;
+	return FALSE;
+}
+
+static int
+wl_ext_check_rxf0ovfl_reinit(const struct wl_rxf0ovfl_sample *d,
+	struct wl_rxf0ovfl_state *st)
+{
+	/* Track whether RX BlockAck has been healthy on this link. */
+	if (d->txback >= RX_BA_ACTIVE_MIN && d->txackfrm < d->txback)
+		st->seen_txback = TRUE;
+
+	if (st->wait_recovery) {
+		if (wl_ext_rxf0ovfl_check_recovered(d, st))
+			st->wait_recovery = FALSE;
+		return RXF0_ACT_NONE;
+	}
+
+	if (st->retry_cooldown > 0) {
+		st->ovfl_stall_cnt = 0;
+		st->ba_stall_cnt = 0;
+		if (wl_ext_rxf0ovfl_check_recovered(d, st)) {
+			st->retry_cooldown = 0;
+			st->retry_backoff = 0;
+		} else {
+			st->retry_cooldown--;
+		}
+		return RXF0_ACT_NONE;
+	}
+
+	/* Fast path: vendor rule when beacons drop alongside heavy RX FIFO 0 overflow. */
+	if (d->rxbeaconmbss < RXF0OVFL_BCN_MIN &&
+	    d->rxf0ovfl > RXF0OVFL_THRESHOLD &&
+	    (uint64)d->rxf0ovfl * 100 >= (uint64)d->rxframe * RXF0OVFL_RATIO_PCT) {
+		st->ovfl_stall_cnt = 0;
+		st->ba_stall_cnt = 0;
+		return RXF0_ACT_REINIT_OVFL;
+	}
+
+	/* Path 1: sustained high RX FIFO 0 overflow ratio even when beacons still arrive. */
+	if (d->rxf0ovfl >= RXF0OVFL_STALL_MIN &&
+	    (uint64)d->rxf0ovfl * 100 >= (uint64)d->rxframe * RXF0OVFL_RATIO_PCT) {
+		if (++st->ovfl_stall_cnt >= RXF0OVFL_STALL_SECS) {
+			st->ovfl_stall_cnt = 0;
+			st->ba_stall_cnt = 0;
+			return RXF0_ACT_REINIT_OVFL;
+		}
+	} else {
+		st->ovfl_stall_cnt = 0;
+	}
+
+	/* Path 2: observe-only log for BA collapse; never trigger WLC_INIT from this branch. */
+	if (st->seen_txback &&
+	    d->txackfrm >= RX_BA_TXACK_MIN &&
+	    d->rxframe <= RX_BA_RXFRAME_MAX &&
+	    (uint64)d->txackfrm >= (uint64)d->txback * RX_BA_TXACK_RATIO) {
+		if (++st->ba_stall_cnt >= RX_BA_STALL_SECS) {
+			st->ba_stall_cnt = 0;
+			st->seen_txback = FALSE;
+			return RXF0_ACT_LOG_BA_STALL;
+		}
+	} else {
+		st->ba_stall_cnt = 0;
+	}
+
+	return RXF0_ACT_NONE;
+}
+
+static int
+wl_ext_rxf0ovfl_step(struct wl_rxf0ovfl_sample *baseline,
+	struct wl_rxf0ovfl_state *st, const struct wl_rxf0ovfl_sample *cur,
+	bool sample_ok, struct wl_rxf0ovfl_sample *diff_out)
+{
+	memset(diff_out, 0, sizeof(*diff_out));
+
+	if (!sample_ok) {
+		wl_ext_rxf0ovfl_reset_window(st);
+		return RXF0_ACT_NONE;
+	}
+
+	if (!st->baseline_valid) {
+		*baseline = *cur;
+		st->baseline_valid = TRUE;
+		return RXF0_ACT_NONE;
+	}
+
+	diff_out->rxbeaconmbss = cur->rxbeaconmbss - baseline->rxbeaconmbss;
+	diff_out->rxf0ovfl = cur->rxf0ovfl - baseline->rxf0ovfl;
+	diff_out->rxframe = cur->rxframe - baseline->rxframe;
+	diff_out->txackfrm = cur->txackfrm - baseline->txackfrm;
+	diff_out->txback = cur->txback - baseline->txback;
+	*baseline = *cur;
+
+	return wl_ext_check_rxf0ovfl_reinit(diff_out, st);
+}
+
 static void
 wl_ext_rxf0ovfl_reinit_handler(struct wl_if_info *cur_if, const wl_event_msg_t *e, void *data)
 {
@@ -5386,62 +5665,69 @@ wl_ext_rxf0ovfl_reinit_handler(struct wl_if_info *cur_if, const wl_event_msg_t *
 	uint32 etype = ntoh32(e->event_type);
 	uint32 reason = ntoh32(e->reason);
 	uint32 status = ntoh32(e->status);
-	uint16 flags =  ntoh16(e->flags);
-	uint32 rxbeaconmbss, rxbeaconmbss_diff = 0, rxf0ovfl, rxf0ovfl_diff = 0;
-	int ret = 0;
-	bool reinit = FALSE;
+	uint16 flags = ntoh16(e->flags);
+	struct wl_rxf0ovfl_sample cur, diff;
+	bool link_up, sample_ok;
+	int act, ret;
 
-	if (!(dhd->conf->war & FW_REINIT_RXF0OVFL)) {
+	if (!(dhd->conf->war & FW_REINIT_RXF0OVFL))
+		return;
+
+	link_up = ((cur_if->ifmode == ISTA_MODE) &&
+		(etype == WLC_E_LINK) && (flags & WLC_EVENT_MSG_LINK)) ||
+		((cur_if->ifmode == IAP_MODE) &&
+		((etype == WLC_E_SET_SSID && status == WLC_E_STATUS_SUCCESS) ||
+		(etype == WLC_E_LINK && status == WLC_E_STATUS_SUCCESS &&
+		reason == WLC_E_REASON_INITIAL_ASSOC)));
+
+	if (link_up) {
+		memset(&apsta_params->rxf0_st, 0, sizeof(apsta_params->rxf0_st));
+		if (wl_ext_rxf0_read_sample(cur_if, &cur)) {
+			apsta_params->rxf0_cnt = cur;
+			apsta_params->rxf0_st.baseline_valid = TRUE;
+		}
+		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
 		return;
 	}
 
-	if ((cur_if->ifmode == ISTA_MODE) &&
-			(etype == WLC_E_LINK) && (flags & WLC_EVENT_MSG_LINK)) {
-		// Link up
-		wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
-		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
-	}
-	else if ((cur_if->ifmode == IAP_MODE) &&
-			((etype == WLC_E_SET_SSID && status == WLC_E_STATUS_SUCCESS) ||
-			(etype == WLC_E_LINK && status == WLC_E_STATUS_SUCCESS &&
-			reason == WLC_E_REASON_INITIAL_ASSOC))) {
-		// Link up
-		wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
-		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
-	}
-	else if ((etype == WLC_E_RESERVED) && (reason == ISAM_RC_RXF0OVFL_REINIT) &&
-			(wl_ext_iapsta_other_if_enabled(cur_if->dev))) {
-		rxbeaconmbss = apsta_params->rxbeaconmbss;
-		rxf0ovfl = apsta_params->rxf0ovfl;
-		wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
-		if (ret)
-			goto done;
-		rxf0ovfl_diff = apsta_params->rxf0ovfl - rxf0ovfl;
-		rxbeaconmbss_diff = apsta_params->rxbeaconmbss - rxbeaconmbss;
-		if (rxf0ovfl_diff > 0) {
-			IAPSTA_INFO(cur_if->ifname,
-				"rxf0ovfl diff = %d, rxbeaconmbss diff = %d\n",
-				rxf0ovfl_diff, rxbeaconmbss_diff);
-		}
-		if (wl_ext_if_enabled(apsta_params, ISTA_MODE)) {
-			if (rxbeaconmbss_diff < 5 && rxf0ovfl_diff > RXF0OVFL_THRESHOLD)
-				reinit = TRUE;
-		}
-#if 0
-		else if (wl_ext_if_enabled(apsta_params, IAP_MODE)) {
-			if (rxf0ovfl_diff > RXF0OVFL_THRESHOLD)
-				reinit = TRUE;
-		}
-#endif
-		if (reinit) {
-			WL_MSG(cur_if->ifname, "wl reinit\n");
-			wl_ext_ioctl(cur_if->dev, WLC_INIT, NULL, 0, 1);
-		}
-done:
-		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
+	if (etype != WLC_E_RESERVED || reason != ISAM_RC_RXF0OVFL_REINIT ||
+	    !wl_ext_iapsta_other_if_enabled(cur_if->dev))
+		return;
+
+	sample_ok = wl_ext_rxf0_read_sample(cur_if, &cur);
+	if (!wl_ext_if_enabled(apsta_params, ISTA_MODE)) {
+		wl_ext_rxf0ovfl_reset_window(&apsta_params->rxf0_st);
+		goto done;
 	}
 
-	return;
+	act = wl_ext_rxf0ovfl_step(&apsta_params->rxf0_cnt, &apsta_params->rxf0_st,
+		&cur, sample_ok, &diff);
+	if (sample_ok && diff.rxf0ovfl > 0) {
+		IAPSTA_INFO(cur_if->ifname,
+			"rxf0ovfl diff=%u rxframe=%u bcn=%u txack=%u txback=%u\n",
+			diff.rxf0ovfl, diff.rxframe, diff.rxbeaconmbss,
+			diff.txackfrm, diff.txback);
+	}
+
+	if (act == RXF0_ACT_REINIT_OVFL) {
+		WL_MSG(cur_if->ifname,
+			"wl reinit (rxf0ovfl=%u rxframe=%u bcn=%u)\n",
+			diff.rxf0ovfl, diff.rxframe, diff.rxbeaconmbss);
+		ret = wl_ext_ioctl(cur_if->dev, WLC_INIT, NULL, 0, 1);
+		wl_ext_rxf0ovfl_on_reinit_result(&apsta_params->rxf0_st, ret);
+		if (ret) {
+			IAPSTA_ERROR(cur_if->ifname,
+				"wl reinit failed (%d), backoff %u s\n",
+				ret, apsta_params->rxf0_st.retry_backoff);
+		}
+	} else if (act == RXF0_ACT_LOG_BA_STALL) {
+		WL_MSG(cur_if->ifname,
+			"rx ba collapse observed (txack=%u txback=%u rxframe=%u bcn=%u), log-only\n",
+			diff.txackfrm, diff.txback, diff.rxframe, diff.rxbeaconmbss);
+	}
+
+done:
+	wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
 }
 #endif /* RXF0OVFL_REINIT_WAR */
 
