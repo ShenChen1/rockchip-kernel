@@ -320,6 +320,8 @@ typedef struct wl_apsta_params {
 	timer_list_compat_t rxf0ovfl_timer;
 	uint32 rxbeaconmbss;
 	uint32 rxf0ovfl;
+	bool rx_counters_seen;
+	bool rxf0ovfl_valid;
 	int war_reason;
 #endif /* RXF0OVFL_REINIT_WAR */
 } wl_apsta_params_t;
@@ -5175,6 +5177,7 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 			if (len != sizeof(wl_cnt_v_le10_mcst_t)) {
 				printf("type %d: cnt struct length mismatch! %d != %d\n",
 					type, len, (int)sizeof(wl_cnt_v_le10_mcst_t));
+				return BCME_BADLEN;
 			}
 #ifdef RESET_AP_WAR
 			if (apsta_params->war_reason == ISAM_RC_AP_RESET)
@@ -5184,6 +5187,7 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
 				apsta_params->rxbeaconmbss = dtoh32(cnt->rxbeaconmbss);
 				apsta_params->rxf0ovfl = dtoh32(cnt->rxf0ovfl);
+				apsta_params->rx_counters_seen = TRUE;
 			}
 #endif /* RXF0OVFL_REINIT_WAR */
 			break;
@@ -5195,6 +5199,7 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 				IAPSTA_ERROR(cur_if->ifname,
 					"type 0x%x, cnt struct length mismatch! %d != %d\n",
 					type, len, (int)sizeof(wl_cnt_ge40mcst_v1_t));
+				return BCME_BADLEN;
 			}
 #ifdef RESET_AP_WAR
 			if (apsta_params->war_reason == ISAM_RC_AP_RESET)
@@ -5204,6 +5209,7 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
 				apsta_params->rxbeaconmbss = dtoh32(cnt->rxbeaconmbss);
 				apsta_params->rxf0ovfl = dtoh32(cnt->rxf0ovfl);
+				apsta_params->rx_counters_seen = TRUE;
 			}
 #endif /* RXF0OVFL_REINIT_WAR */
 			break;
@@ -5215,6 +5221,7 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 				IAPSTA_ERROR(cur_if->ifname,
 					"type 0x%x, cnt struct length mismatch! %d != %d\n",
 					type, len, (int)sizeof(wl_cnt_ge80mcst_v1_t));
+				return BCME_BADLEN;
 			}
 #ifdef RESET_AP_WAR
 			if (apsta_params->war_reason == ISAM_RC_AP_RESET)
@@ -5224,6 +5231,7 @@ wl_ext_counters_cbfn(void *ctx, const uint8 *data, uint16 type, uint16 len)
 			if (apsta_params->war_reason == ISAM_RC_RXF0OVFL_REINIT) {
 				apsta_params->rxbeaconmbss = dtoh32(cnt->rxbeaconmbss);
 				apsta_params->rxf0ovfl = dtoh32(cnt->rxf0ovfl);
+				apsta_params->rx_counters_seen = TRUE;
 			}
 #endif /* RXF0OVFL_REINIT_WAR */
 			break;
@@ -5245,6 +5253,10 @@ wl_ext_counters_update(struct wl_if_info *cur_if, int war_reason)
 	uint16 ver;
 	int ret = 0;
 
+#ifdef RXF0OVFL_REINIT_WAR
+	if (war_reason == ISAM_RC_RXF0OVFL_REINIT)
+		apsta_params->rx_counters_seen = FALSE;
+#endif
 	ret = wldev_iovar_getbuf(cur_if->dev, "counters", NULL, 0,
 		iovar_buf, WLC_IOCTL_MEDLEN, NULL);
 	if (unlikely(ret)) {
@@ -5256,11 +5268,16 @@ wl_ext_counters_update(struct wl_if_info *cur_if, int war_reason)
 	cntinfo->version = dtoh16(cntinfo->version);
 	cntinfo->datalen = dtoh16(cntinfo->datalen);
 	ver = cntinfo->version;
-	CHK_CNTBUF_DATALEN(iovar_buf, WLC_IOCTL_MEDLEN);
+	if (cntinfo->datalen > WLC_IOCTL_MEDLEN - OFFSETOF(wl_cnt_info_t, data)) {
+		IAPSTA_ERROR(cur_if->ifname, "counters response exceeds ioctl buffer\n");
+		ret = BCME_BADLEN;
+		goto exit;
+	}
 	if (ver > WL_CNT_VERSION_XTLV) {
 		IAPSTA_ERROR(cur_if->ifname,
 			"Incorrect version of counters struct: expected %d; got %d\n",
 			WL_CNT_VERSION_XTLV, ver);
+		ret = BCME_VERSION;
 		goto exit;
 	}
 
@@ -5286,6 +5303,12 @@ wl_ext_counters_update(struct wl_if_info *cur_if, int war_reason)
 		IAPSTA_ERROR(cur_if->ifname, "bcm_unpack_xtlv_buf failed %d\n", ret);
 		goto exit;
 	}
+#ifdef RXF0OVFL_REINIT_WAR
+	if (war_reason == ISAM_RC_RXF0OVFL_REINIT && !apsta_params->rx_counters_seen) {
+		IAPSTA_ERROR(cur_if->ifname, "RX counters missing from counters response\n");
+		ret = BCME_NOTFOUND;
+	}
+#endif
 
 exit:
 	return ret;
@@ -5398,7 +5421,12 @@ wl_ext_rxf0ovfl_reinit_handler(struct wl_if_info *cur_if, const wl_event_msg_t *
 	if ((cur_if->ifmode == ISTA_MODE) &&
 			(etype == WLC_E_LINK) && (flags & WLC_EVENT_MSG_LINK)) {
 		// Link up
-		wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
+		apsta_params->rxf0ovfl_valid = FALSE;
+		ret = wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
+		if (!ret)
+			apsta_params->rxf0ovfl_valid = TRUE;
+		else
+			IAPSTA_ERROR(cur_if->ifname, "RX counter baseline failed %d\n", ret);
 		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
 	}
 	else if ((cur_if->ifmode == IAP_MODE) &&
@@ -5406,26 +5434,56 @@ wl_ext_rxf0ovfl_reinit_handler(struct wl_if_info *cur_if, const wl_event_msg_t *
 			(etype == WLC_E_LINK && status == WLC_E_STATUS_SUCCESS &&
 			reason == WLC_E_REASON_INITIAL_ASSOC))) {
 		// Link up
-		wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
+		apsta_params->rxf0ovfl_valid = FALSE;
+		ret = wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
+		if (!ret)
+			apsta_params->rxf0ovfl_valid = TRUE;
+		else
+			IAPSTA_ERROR(cur_if->ifname, "RX counter baseline failed %d\n", ret);
 		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
 	}
-	else if ((etype == WLC_E_RESERVED) && (reason == ISAM_RC_RXF0OVFL_REINIT) &&
-			(wl_ext_iapsta_other_if_enabled(cur_if->dev))) {
+	else if ((etype == WLC_E_RESERVED) && (reason == ISAM_RC_RXF0OVFL_REINIT)) {
+		if (!wl_ext_iapsta_other_if_enabled(cur_if->dev)) {
+			IAPSTA_INFO(cur_if->ifname,
+				"RX polling stopped: no associated interface\n");
+			return;
+		}
 		rxbeaconmbss = apsta_params->rxbeaconmbss;
 		rxf0ovfl = apsta_params->rxf0ovfl;
-		wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
-		if (ret)
+		ret = wl_ext_counters_update(cur_if, ISAM_RC_RXF0OVFL_REINIT);
+		if (ret) {
+			IAPSTA_DBG(cur_if->ifname,
+				"RX counters ret=%d rxf0ovfl=%u rxbeaconmbss=%u\n",
+				ret, rxf0ovfl, rxbeaconmbss);
 			goto done;
+		}
+		if (!apsta_params->rxf0ovfl_valid ||
+				apsta_params->rxf0ovfl < rxf0ovfl ||
+				apsta_params->rxbeaconmbss < rxbeaconmbss) {
+			apsta_params->rxf0ovfl_valid = TRUE;
+			IAPSTA_DBG(cur_if->ifname,
+				"RX counters baseline rxf0ovfl=%u rxbeaconmbss=%u\n",
+				apsta_params->rxf0ovfl, apsta_params->rxbeaconmbss);
+			goto done;
+		}
 		rxf0ovfl_diff = apsta_params->rxf0ovfl - rxf0ovfl;
 		rxbeaconmbss_diff = apsta_params->rxbeaconmbss - rxbeaconmbss;
+		IAPSTA_DBG(cur_if->ifname,
+			"RX counters ret=%d rxf0ovfl=%u diff=%u rxbeaconmbss=%u diff=%u\n",
+			ret, apsta_params->rxf0ovfl, rxf0ovfl_diff,
+			apsta_params->rxbeaconmbss, rxbeaconmbss_diff);
 		if (rxf0ovfl_diff > 0) {
 			IAPSTA_INFO(cur_if->ifname,
-				"rxf0ovfl diff = %d, rxbeaconmbss diff = %d\n",
+				"rxf0ovfl diff = %u, rxbeaconmbss diff = %u\n",
 				rxf0ovfl_diff, rxbeaconmbss_diff);
 		}
 		if (wl_ext_if_enabled(apsta_params, ISTA_MODE)) {
 			if (rxbeaconmbss_diff < 5 && rxf0ovfl_diff > RXF0OVFL_THRESHOLD)
 				reinit = TRUE;
+			else if (rxf0ovfl_diff > RXF0OVFL_THRESHOLD)
+				IAPSTA_INFO(cur_if->ifname,
+					"RX reinit skipped: rxbeaconmbss diff=%u\n",
+					rxbeaconmbss_diff);
 		}
 #if 0
 		else if (wl_ext_if_enabled(apsta_params, IAP_MODE)) {
@@ -5435,7 +5493,11 @@ wl_ext_rxf0ovfl_reinit_handler(struct wl_if_info *cur_if, const wl_event_msg_t *
 #endif
 		if (reinit) {
 			WL_MSG(cur_if->ifname, "wl reinit\n");
-			wl_ext_ioctl(cur_if->dev, WLC_INIT, NULL, 0, 1);
+			ret = wl_ext_ioctl(cur_if->dev, WLC_INIT, NULL, 0, 1);
+			if (ret)
+				IAPSTA_ERROR(cur_if->ifname, "WLC_INIT failed %d\n", ret);
+			else
+				apsta_params->rxf0ovfl_valid = FALSE;
 		}
 done:
 		wl_timer_mod(dhd, &apsta_params->rxf0ovfl_timer, RXF0OVFL_POLLING_TIMEOUT);
